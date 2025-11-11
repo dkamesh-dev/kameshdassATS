@@ -1,139 +1,339 @@
+"""
+Single-file Flask web app for the "ATS Resume Analyzer" workflow.
+
+Features
+- Upload a resume PDF
+- Paste / edit a Job Description
+- Extract text from uploaded PDF (PyMuPDF / fitz)
+- Run ATS-style scoring across categories
+- Show missing keywords, missing skills, recommended copy-paste resume improvements
+- Simple, clean single-file setup (no external templates required)
+
+Requirements
+pip install flask pymupdf
+
+Run
+python ats_resume_analyzer_flask_app.py
+Open http://127.0.0.1:5000 in your browser
+
+Notes
+- This is deliberately single-file for easy testing. If you want a multi-file project (separate templates/static), I can split it.
+- The scoring logic is intentionally transparent and easy to tweak.
+"""
+
+from flask import Flask, request, redirect, url_for, render_template_string, send_file
+from werkzeug.utils import secure_filename
+import fitz  # PyMuPDF
+import tempfile
+import os
 import re
-import io
-import fitz  # PyMuPDF for PDF text extraction
 from collections import Counter
-from typing import Dict, List
+import json
 
-# =============== INPUTS ===============
+app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 8 * 1024 * 1024  # 8 MB upload limit
+app.config['UPLOAD_EXTENSIONS'] = ['.pdf']
 
-def read_resume_pdf(file_path: str) -> str:
-    """Extract text from a PDF resume."""
-    with fitz.open(file_path) as pdf:
-        text = ""
-        for page in pdf:
-            text += page.get_text("text")
-    return text.strip()
+# -------------------- HTML TEMPLATE (rendered inline) --------------------
+INDEX_HTML = """
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>ATS Resume Analyzer</title>
+    <style>
+      body{font-family:Inter, system-ui, -apple-system, 'Segoe UI', Roboto, Arial;max-width:980px;margin:18px auto;padding:12px}
+      header{display:flex;align-items:center;gap:12px}
+      h1{margin:0;font-size:22px}
+      form{margin-top:12px;padding:12px;border:1px solid #e6e6e6;border-radius:8px}
+      label{display:block;margin:8px 0 4px;font-weight:600}
+      textarea{width:100%;min-height:140px;padding:10px;border-radius:6px;border:1px solid #ddd}
+      input[type=file]{padding:6px}
+      button{background:#0069ff;color:#fff;border:0;padding:10px 14px;border-radius:8px;font-weight:600}
+      .report{margin-top:18px;padding:14px;border-radius:8px;border:1px solid #eee;background:#fafafa}
+      .score{font-size:28px;font-weight:700}
+      table{width:100%;border-collapse:collapse;margin-top:8px}
+      th,td{border:1px solid #eee;padding:8px;text-align:left}
+      .mono{font-family:Menlo,monospace,monospace}
+      .small{font-size:13px;color:#666}
+      .pill{display:inline-block;padding:6px 8px;border-radius:999px;border:1px solid #ddd;margin:2px}
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>ATS Resume Analyzer</h1>
+    </header>
+
+    <form method="post" enctype="multipart/form-data" action="/analyze">
+      <label for="resume">Resume PDF</label>
+      <input id="resume" name="resume" type="file" accept=".pdf" required>
+
+      <label for="jd">Job Description (paste or edit)</label>
+      <textarea id="jd" name="job_description">{{ default_jd }}</textarea>
+
+      <div style="display:flex;gap:8px;margin-top:12px">
+        <button type="submit">Run Analysis</button>
+        <a href="/" style="align-self:center;margin-left:6px;color:#0069ff;text-decoration:none">Reset</a>
+      </div>
+    </form>
+
+  {% if report %}
+    <div class="report">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <div>
+          <div class="small">Total ATS Score</div>
+          <div class="score">{{ report['Total ATS Score'] }} / 100</div>
+          <div class="small">(Higher is better — 80+ is strong)</div>
+        </div>
+        <div style="text-align:right">
+          <a href="/download" style="text-decoration:none"><button>Download JSON Report</button></a>
+        </div>
+      </div>
+
+      <h3 style="margin-top:12px">Score Breakdown</h3>
+      <table>
+        <thead><tr><th>Category</th><th>Score</th></tr></thead>
+        <tbody>
+          {% for k,v in report['Breakdown'].items() %}
+          <tr><td>{{ k }}</td><td>{{ v }}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+
+      <h3 style="margin-top:12px">Top Matched Keywords</h3>
+      <div>
+        {% for kw in report['Matched Keywords'][:40] %}
+          <span class="pill">{{ kw }}</span>
+        {% else %}
+          <div class="small">No matched keywords detected.</div>
+        {% endfor %}
+      </div>
+
+      <h3 style="margin-top:12px">Missing Important Keywords (sample)</h3>
+      <div class="small mono">{{ report['Missing Keywords'][:60] }}</div>
+
+      <h3 style="margin-top:12px">Missing Skills</h3>
+      <div>
+        {% for s in report['Missing Skills'] %}
+          <span class="pill">{{ s }}</span>
+        {% else %}
+          <div class="small">No missing skills from the canonical set.</div>
+        {% endfor %}
+      </div>
+
+      <h3 style="margin-top:12px">Copy-paste Ready Improvements</h3>
+      <ol>
+        {% for line in report['Improvement Lines'] %}
+          <li class="mono">{{ line }}</li>
+        {% endfor %}
+      </ol>
+
+      <h3 style="margin-top:12px">Actionable Recommendations</h3>
+      <ul>
+        {% for rec in report['Recommendations'] %}
+          <li>{{ rec }}</li>
+        {% endfor %}
+      </ul>
+
+    </div>
+  {% endif %}
+
+  </body>
+</html>
+"""
+
+# -------------------- Helper functions --------------------
+
+def extract_text_from_pdf(path: str) -> str:
+    """Extract text from a PDF using PyMuPDF (fitz)."""
+    try:
+        doc = fitz.open(path)
+        text_chunks = []
+        for page in doc:
+            text_chunks.append(page.get_text("text"))
+        return "\n".join(text_chunks).strip()
+    except Exception as e:
+        return ""
+
 
 def preprocess_text(text: str) -> str:
-    """Basic cleaning for text comparison."""
+    text = text or ""
     text = text.lower()
-    text = re.sub(r'[^a-z0-9\s]', '', text)
-    return text
+    # remove special characters but keep spaces and plus sign (e.g., c++), hyphens
+    text = re.sub(r"[^a-z0-9\s+\-\\/]", " ", text)
+    # collapse whitespace
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
-# =============== ANALYZER CORE ===============
 
-def calculate_ats_score(resume_text: str, job_description: str) -> Dict:
-    """Analyze resume text vs job description."""
-    
-    resume_text_clean = preprocess_text(resume_text)
-    jd_clean = preprocess_text(job_description)
+# Canonical skill keywords (tailor this list to your JD family)
+CANONICAL_SKILLS = [
+    "salesforce", "crm", "customer service", "communication", "excel",
+    "microsoft office", "word", "powerpoint", "document management",
+    "data entry", "reporting", "project management", "filing",
+    "scrum", "agile", "queue management", "salesforce chatter",
+    "ticketing", "case management"
+]
 
-    # Tokenize
-    resume_words = set(resume_text_clean.split())
-    jd_words = set(jd_clean.split())
 
-    # ===== 1️⃣ Keyword Match (30 pts) =====
-    matched_keywords = resume_words.intersection(jd_words)
-    keyword_score = min(30, (len(matched_keywords) / len(jd_words)) * 30)
+def calculate_ats_score(resume_text: str, job_description: str) -> dict:
+    r = preprocess_text(resume_text)
+    j = preprocess_text(job_description)
 
-    # ===== 2️⃣ Skills Alignment (25 pts) =====
-    skill_keywords = [
-        "salesforce", "customer service", "data entry", "excel", "crm",
-        "document management", "communication", "filing", "project support",
-        "reporting", "microsoft office", "teamwork", "problem solving"
-    ]
-    matched_skills = [s for s in skill_keywords if s in resume_text_clean]
-    skills_score = (len(matched_skills) / len(skill_keywords)) * 25
+    resume_words = set(r.split())
+    jd_words = set(j.split())
 
-    # ===== 3️⃣ Experience Relevance (20 pts) =====
-    experience_keywords = [
-        "experience", "managed", "handled", "coordinated", "supported",
-        "projects", "clients", "reporting", "operations"
-    ]
-    matched_exp = [e for e in experience_keywords if e in resume_text_clean]
-    exp_score = (len(matched_exp) / len(experience_keywords)) * 20
+    # Keyword Match (30 pts)
+    matched_keywords = sorted(list(resume_words.intersection(jd_words)))
+    keyword_ratio = (len(matched_keywords) / max(1, len(jd_words)))
+    keyword_score = round(min(30, keyword_ratio * 30), 2)
 
-    # ===== 4️⃣ ATS Formatting (15 pts) =====
-    ats_format_penalty = 0
-    if 'table' in resume_text.lower() or 'graphic' in resume_text.lower():
-        ats_format_penalty = 3  # simple penalty if tables/graphics detected
-    ats_score = 15 - ats_format_penalty
+    # Skills Alignment (25 pts)
+    matched_skills = [s for s in CANONICAL_SKILLS if s in r]
+    skills_score = round((len(matched_skills) / len(CANONICAL_SKILLS)) * 25, 2)
 
-    # ===== 5️⃣ Qualification Match (10 pts) =====
-    qualification_keywords = ["bachelor", "degree", "diploma", "certification"]
-    matched_qual = [q for q in qualification_keywords if q in resume_text_clean]
-    qual_score = (len(matched_qual) / len(qualification_keywords)) * 10
+    # Experience Relevance (20 pts) — look for action verbs and experience mentions
+    experience_terms = ["managed", "coordinated", "supported", "handled", "led", "responsible for", "experience"]
+    matched_exp = [t for t in experience_terms if t in r]
+    exp_score = round((len(matched_exp) / len(experience_terms)) * 20, 2)
 
-    # ===== Final =====
-    total_score = round(keyword_score + skills_score + exp_score + ats_score + qual_score, 2)
-    missing_keywords = list(jd_words - resume_words)
-    missing_skills = [s for s in skill_keywords if s not in resume_text_clean]
+    # ATS Formatting (15 pts) — simple heuristics
+    ats_penalty = 0
+    if re.search(r"\btable\b|\bgraphic\b|\.png|\.jpg|\.jpeg|<svg|<table", resume_text.lower()):
+        ats_penalty += 4
+    # extremely short resumes get a penalty
+    if len(r.split()) < 150:
+        ats_penalty += 3
+    ats_score = max(0, 15 - ats_penalty)
+
+    # Qualifications Match (10 pts)
+    qual_terms = ["bachelor", "bsc", "ba", "bachelor's", "degree", "mba", "mca", "diploma", "certification"]
+    matched_qual = [q for q in qual_terms if q in r]
+    qual_score = round((len(matched_qual) / len(qual_terms)) * 10, 2)
+
+    total = round(keyword_score + skills_score + exp_score + ats_score + qual_score, 2)
+
+    missing_keywords = sorted(list(jd_words - resume_words))
+    missing_skills = [s for s in CANONICAL_SKILLS if s not in r]
+
+    # Generate copy-paste improvement lines (simple templates)
+    improvement_lines = []
+    # Suggest adding matched skills as a headline if present in JD but missing
+    to_suggest = matched_skills + missing_skills[:6]
+    # create 6 sample accomplishment lines
+    for i, skill in enumerate(to_suggest[:6]):
+        improvement_lines.append(f"{skill.capitalize()} — Demonstrated experience using {skill} to improve process efficiency and customer satisfaction (quantify with metrics where possible).")
+
+    # If JD mentions Salesforce explicitly, provide a Salesforce-focused line
+    if 'salesforce' in j and 'salesforce' not in r:
+        improvement_lines.insert(0, "Salesforce: Hands-on experience with Salesforce CRM — managing cases, updating records, and using Salesforce Chatter to respond to internal client inquiries.")
+
+    # Recommendations (prioritized)
+    recommendations = []
+    if keyword_score < 20:
+        recommendations.append("Add more exact keywords from the job description — mirror phrasing (e.g., 'Responding to internal client inquiries via email or Salesforce chatter').")
+    if skills_score < 18:
+        recommendations.append("Emphasize the missing skills near the top of the resume (Summary or Key Skills).")
+    if exp_score < 12:
+        recommendations.append("Add 2–3 achievement-oriented bullet points for recent roles that use action verbs (managed, coordinated, supported). Quantify results when possible.")
+    if ats_score < 10:
+        recommendations.append("Simplify formatting: remove images, tables, and complex layouts. Use standard fonts and bullet points.")
+    if qual_score < 6:
+        recommendations.append("Add education and certifications clearly (degree names, institution, and year).")
+    if not recommendations:
+        recommendations.append("Resume looks well-aligned — consider minor wording tweaks to improve keyword density.")
 
     return {
-        "Total ATS Score": total_score,
-        "Breakdown": {
-            "Keyword Match": round(keyword_score, 2),
-            "Skills Alignment": round(skills_score, 2),
-            "Experience Relevance": round(exp_score, 2),
-            "ATS Formatting": round(ats_score, 2),
-            "Qualifications Match": round(qual_score, 2)
+        'Total ATS Score': total,
+        'Breakdown': {
+            'Keyword Match': keyword_score,
+            'Skills Alignment': skills_score,
+            'Experience Relevance': exp_score,
+            'ATS Formatting': ats_score,
+            'Qualifications Match': qual_score
         },
-        "Matched Keywords": list(matched_keywords),
-        "Missing Keywords": missing_keywords[:15],  # top 15 missing
-        "Missing Skills": missing_skills,
+        'Matched Keywords': matched_keywords,
+        'Missing Keywords': missing_keywords,
+        'Missing Skills': missing_skills,
+        'Improvement Lines': improvement_lines,
+        'Recommendations': recommendations,
+        # keep a serialized copy for download
+        '_internal': {
+            'resume_text_snippet': r[:1000],
+            'job_description_snippet': j[:1000]
+        }
     }
 
-# =============== IMPROVEMENT SUGGESTIONS ===============
 
-def generate_recommendations(result: Dict) -> List[str]:
-    """Generate optimization recommendations based on missing elements."""
-    recommendations = []
+# -------------------- Flask routes --------------------
 
-    if result["Breakdown"]["Keyword Match"] < 25:
-        recommendations.append("Add more keywords from the job description (especially ones related to Salesforce, document management, and customer communication).")
+# store last report in-memory for download convenience (small demo app)
+LAST_REPORT = {}
 
-    if result["Breakdown"]["Skills Alignment"] < 20:
-        recommendations.append(f"Include missing skills: {', '.join(result['Missing Skills'][:5])}")
+DEFAULT_JD = (
+    "Responding to internal client inquiries via email or Salesforce chatter.\n"
+    "Assisting in various EMC/EPS Projects such as Group Split projects, minute book and document uploads,\n"
+    "and managing customer portfolios. Providing exceptional customer service, maintaining and updating records,\n"
+    "and handling corporate filings."
+)
 
-    if result["Breakdown"]["Experience Relevance"] < 15:
-        recommendations.append("Add more project or client-handling experience descriptions using action verbs like 'managed', 'supported', 'coordinated'.")
 
-    if result["Breakdown"]["Qualifications Match"] < 8:
-        recommendations.append("Add your educational qualifications clearly, e.g., 'Bachelor’s Degree in Business Administration'.")
+@app.route('/', methods=['GET'])
+def index():
+    return render_template_string(INDEX_HTML, default_jd=DEFAULT_JD, report=None)
 
-    recommendations.append("Keep formatting simple — use plain text, consistent bullet points, and avoid tables or images for ATS compatibility.")
 
-    return recommendations
+@app.route('/analyze', methods=['POST'])
+def analyze():
+    uploaded_file = request.files.get('resume')
+    jd = request.form.get('job_description', '')
 
-# =============== MAIN FLOW ===============
+    if not uploaded_file:
+        return redirect(url_for('index'))
 
-def run_ats_resume_analyzer(resume_path: str, job_description: str):
-    resume_text = read_resume_pdf(resume_path)
-    result = calculate_ats_score(resume_text, job_description)
-    suggestions = generate_recommendations(result)
+    filename = secure_filename(uploaded_file.filename)
+    ext = os.path.splitext(filename)[1].lower()
+    if ext not in app.config['UPLOAD_EXTENSIONS']:
+        return "Invalid file type", 400
 
-    print("\n===== ATS RESUME ANALYZER REPORT =====")
-    print(f"Total Score: {result['Total ATS Score']}/100\n")
-    print("Breakdown:")
-    for k, v in result["Breakdown"].items():
-        print(f"  - {k}: {v}")
+    # save to a temp file
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
+    uploaded_file.save(tmp.name)
+    tmp.close()
 
-    print("\nMissing Keywords:", ', '.join(result["Missing Keywords"][:10]))
-    print("Missing Skills:", ', '.join(result["Missing Skills"]))
-    print("\n📈 Recommendations:")
-    for i, rec in enumerate(suggestions, 1):
-        print(f"{i}. {rec}")
+    try:
+        resume_text = extract_text_from_pdf(tmp.name)
+        if not resume_text:
+            resume_text = ""
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except Exception:
+            pass
 
-# =============== EXAMPLE USAGE ===============
+    report = calculate_ats_score(resume_text, jd)
 
-if __name__ == "__main__":
-    job_description = """
-    Responding to internal client inquiries via email or Salesforce chatter.
-    Assisting in various EMC/EPS Projects such as Group Split projects, minute book and document uploads,
-    and managing customer portfolios. Providing exceptional customer service, maintaining and updating records,
-    and handling corporate filings.
-    """
+    # Persist report in-memory for /download
+    global LAST_REPORT
+    LAST_REPORT = report
 
-    # Example: update with your own resume file path
-    resume_file_path = "resume.pdf"
-    run_ats_resume_analyzer(resume_file_path, job_description)
+    return render_template_string(INDEX_HTML, default_jd=jd, report=report)
+
+
+@app.route('/download', methods=['GET'])
+def download_report():
+    global LAST_REPORT
+    if not LAST_REPORT:
+        return redirect(url_for('index'))
+
+    tmpf = tempfile.NamedTemporaryFile(delete=False, suffix='.json')
+    with open(tmpf.name, 'w', encoding='utf-8') as f:
+        json.dump(LAST_REPORT, f, ensure_ascii=False, indent=2)
+    tmpf.close()
+    return send_file(tmpf.name, as_attachment=True, download_name='ats_report.json')
+
+
+if __name__ == '__main__':
+    # Run in debug mode for local testing. In production, use gunicorn / uvicorn + a WSGI server.
+    app.run(debug=True)
